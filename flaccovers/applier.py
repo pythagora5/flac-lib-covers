@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -47,9 +48,9 @@ class Applier:
                  run_dir: Optional[Path] = None):
         self.s = settings
         self.http = http or HttpClient(settings.user_agent())
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        self.run_dir = run_dir or backups_dir() / stamp
+        self.run_dir = run_dir or _new_run_dir()
         self.manifest: list[dict] = []
+        self._lock = threading.Lock()  # apply() may run on several threads
         self.log_path = app_dir("logs") / "changes.log"
 
     def apply(self, res: AlbumResult) -> str:
@@ -91,12 +92,13 @@ class Applier:
                 except OSError:
                     pass
 
-        self.manifest.append(entry)
-        self._write_manifest()
         w, h = images.probe_bytes(jpeg)
         msg = f"cover.jpg {w}×{h} {len(jpeg) // 1024} KB from {c.source}"
-        with open(self.log_path, "a") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{res.folder.rel}\t{msg}\n")
+        with self._lock:
+            self.manifest.append(entry)
+            self._write_manifest()
+            with open(self.log_path, "a") as log:
+                log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{res.folder.rel}\t{msg}\n")
         return msg
 
     def _write_manifest(self) -> None:
@@ -104,9 +106,22 @@ class Applier:
         (self.run_dir / "manifest.json").write_text(json.dumps(self.manifest, indent=1))
 
 
+def _new_run_dir() -> Path:
+    base = backups_dir() / time.strftime("%Y%m%d-%H%M%S")
+    path, n = base, 1
+    while path.exists():
+        n += 1
+        path = base.with_name(f"{base.name}-{n}")
+    path.mkdir(parents=True)
+    return path
+
+
 def last_run() -> Optional[Path]:
-    runs = sorted(p for p in backups_dir().iterdir()
-                  if p.is_dir() and (p / "manifest.json").exists() and not (p / "UNDONE").exists())
+    runs = sorted((p for p in backups_dir().iterdir()
+                   if p.is_dir() and (p / "manifest.json").exists()
+                   and not (p / "UNDONE").exists()),
+                  key=lambda p: (p.name.split("-")[0], p.name.split("-")[1],
+                                 int(p.name.split("-")[2]) if p.name.count("-") > 1 else 1))
     return runs[-1] if runs else None
 
 

@@ -118,6 +118,7 @@ class Status(str, Enum):
     PROPOSED = "Proposed"
     NEEDS_REVIEW = "Needs review"
     NOT_FOUND = "Nothing found"
+    WRITING = "Writing…"
     APPLIED = "Done"
     FAILED = "Failed"
     SKIPPED = "Skipped"
@@ -133,6 +134,11 @@ class AlbumResult:
     status: Status = Status.PENDING
     message: str = ""
     current_thumb: Optional[bytes] = None
+
+    @property
+    def locked(self) -> bool:
+        """Being written or already written: no more edits."""
+        return self.status in (Status.WRITING, Status.APPLIED)
 
     @property
     def choice(self) -> Optional[Candidate]:

@@ -38,7 +38,7 @@ def test_full_flow(app, library, tmp_path, monkeypatch):
     real_finder = mw_mod.Finder
     monkeypatch.setattr(mw_mod, "Finder", lambda s, c: real_finder(s, c, http))
 
-    s = Settings(library_path=str(library), use_discogs=False)
+    s = Settings(library_path=str(library), use_discogs=False, auto_apply=False)
     w = mw_mod.MainWindow(s, Cache(tmp_path / "c.db"))
     w.show()
     w.scan()
@@ -66,6 +66,7 @@ def _window(app, library, tmp_path, monkeypatch, **settings):
     http = FakeHttp()
     real_finder = mw_mod.Finder
     monkeypatch.setattr(mw_mod, "Finder", lambda s, c: real_finder(s, c, http))
+    settings.setdefault("auto_apply", False)
     s = Settings(library_path=str(library), use_discogs=False, **settings)
     w = mw_mod.MainWindow(s, Cache(tmp_path / "c.db"))
     w.show()
@@ -161,4 +162,36 @@ def test_search_again_shares_results_with_selected_rows(app, library, tmp_path, 
     # the other album keeps its own local image as an option too
     assert any(c.source.startswith("Folder:") for c in rows["Named/Wrong Name"].candidates)
     assert rows["Named/Wrong Name"].info.track_count == 3
+    w.close()
+
+
+def test_confident_matches_are_written_automatically(app, library, tmp_path, monkeypatch):
+    from flaccovers.applier import last_run
+    w = _window(app, library, tmp_path, monkeypatch, auto_apply=True,
+                hidden_issues=["TOO_SMALL"])
+    assert _wait(app, lambda: w._auto is not None and w._auto.queued == 0)
+    rows = {r.folder.rel: r for r in w.model.rows}
+    for rel in ("Radiohead/OK Computer", "Big/Huge Art", "Embedded/Only", "Named/Wrong Name"):
+        assert rows[rel].status == Status.APPLIED, rel
+        assert (library / rel / "cover.jpg").exists()
+    # needs review / hidden albums are left alone
+    assert rows["Various Artists/Now 1"].status != Status.APPLIED
+    assert not (library / "Various Artists" / "Now 1" / "cover.jpg").exists()
+    assert rows["Small/Tiny Art"].status == Status.NOT_SEARCHED
+    assert "Written: " in w.auto_label.text()
+    # one undo run covers the whole automatic batch
+    import json
+    manifest = json.loads((last_run() / "manifest.json").read_text())
+    assert len(manifest) == w._auto.done >= 4
+    w.close()
+
+
+def test_auto_apply_can_be_switched_off(app, library, tmp_path, monkeypatch):
+    w = _window(app, library, tmp_path, monkeypatch, auto_apply=False)
+    assert not any(r.status in (Status.APPLIED, Status.WRITING) for r in w.model.rows)
+    assert not (library / "Radiohead" / "OK Computer" / "cover.jpg").exists()
+    w.auto_box.setChecked(True)
+    assert Settings.load().auto_apply is True
+    w.auto_box.setChecked(False)
+    assert Settings.load().auto_apply is False
     w.close()

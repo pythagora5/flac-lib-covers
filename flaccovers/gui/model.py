@@ -74,9 +74,9 @@ class AlbumModel(QAbstractTableModel):
     def flags(self, index):
         f = Qt.ItemIsEnabled | Qt.ItemIsSelectable
         r = self.rows[index.row()]
-        if index.column() == C_APPLY and r.choice is not None and r.status != Status.APPLIED:
+        if index.column() == C_APPLY and r.choice is not None and not r.locked:
             f |= Qt.ItemIsUserCheckable
-        if index.column() in (C_ARTIST, C_ALBUM) and r.status != Status.APPLIED:
+        if index.column() in (C_ARTIST, C_ALBUM) and not r.locked:
             f |= Qt.ItemIsEditable
         return f
 
@@ -96,7 +96,7 @@ class AlbumModel(QAbstractTableModel):
         r = self.rows[index.row()]
         col = index.column()
         if role == Qt.CheckStateRole and col == C_APPLY:
-            if r.choice is None or r.status == Status.APPLIED:
+            if r.choice is None or r.locked:
                 return None
             return Qt.Checked if r.approved else Qt.Unchecked
         if role == Qt.DecorationRole:
@@ -133,6 +133,7 @@ class AlbumModel(QAbstractTableModel):
                 Status.NOT_FOUND: QColor("#c0392b"),
                 Status.FAILED: QColor("#c0392b"),
                 Status.APPLIED: QColor("#2e8b57"),
+                Status.WRITING: QColor("#2e8b57"),
             }.get(r.status)
         if role == Qt.UserRole:  # sort key
             if col == C_PROPOSAL:
@@ -164,8 +165,7 @@ FILTERS = ["All found problems", "Needs review", "Ready to apply", "Done", "Fail
 
 
 def is_ready(r: AlbumResult) -> bool:
-    return r.approved and r.choice is not None and r.status not in (Status.APPLIED,
-                                                                    Status.PENDING)
+    return r.approved and r.choice is not None and not r.locked and r.status != Status.PENDING
 
 
 class FilterProxy(QSortFilterProxyModel):
@@ -190,7 +190,7 @@ class FilterProxy(QSortFilterProxyModel):
         self._refilter(lambda: setattr(self, "hidden", set(hidden)))
 
     def is_hidden(self, r: AlbumResult) -> bool:
-        return r.folder.issue in self.hidden and r.status != Status.APPLIED
+        return r.folder.issue in self.hidden and not r.locked
 
     def visible_results(self) -> list[AlbumResult]:
         src = self.sourceModel()
@@ -212,11 +212,11 @@ class FilterProxy(QSortFilterProxyModel):
         m = self.mode
         if m == 1:
             return r.status == Status.NEEDS_REVIEW or (not r.approved and r.choice is not None
-                                                      and r.status != Status.APPLIED)
+                                                      and not r.locked)
         if m == 2:
-            return r.approved and r.status != Status.APPLIED
+            return r.approved and not r.locked
         if m == 3:
-            return r.status == Status.APPLIED
+            return r.locked
         if m == 4:
             return r.status in (Status.FAILED, Status.NOT_FOUND)
         return True

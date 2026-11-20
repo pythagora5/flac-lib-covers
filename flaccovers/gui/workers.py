@@ -93,21 +93,75 @@ def research_job(job: Job, res: AlbumResult, info: AlbumInfo, finder: Finder):
     return new
 
 
+def apply_one(res: AlbumResult, applier: Applier, cache: Cache) -> bool:
+    try:
+        res.message = applier.apply(res)
+        res.status = Status.APPLIED
+        res.approved = False
+        res.folder.issue = Issue.OK
+        cache.forget_scan(res.folder.path)
+        return True
+    except Exception as exc:
+        res.status = Status.FAILED
+        res.message = str(exc)
+        return False
+
+
 def apply_job(job: Job, results: list[AlbumResult], applier: Applier, cache: Cache):
     total, ok = len(results), 0
     for i, res in enumerate(results, 1):
         if job.cancel.is_set():
             break
-        try:
-            res.message = applier.apply(res)
-            res.status = Status.APPLIED
-            res.approved = False
-            res.folder.issue = Issue.OK
-            cache.forget_scan(res.folder.path)
-            ok += 1
-        except Exception as exc:
-            res.status = Status.FAILED
-            res.message = str(exc)
+        ok += apply_one(res, applier, cache)
         job.signals.item.emit(res)
         job.signals.progress.emit(i, total, res.folder.rel)
     return ok
+
+
+class AutoApplier(QObject):
+    """Writes confident matches in the background as soon as they are found.
+
+    A small pool overlaps downloading, resizing and writing; it is kept small
+    because the files all land on one (USB) drive."""
+
+    applied = Signal(object)   # AlbumResult, status APPLIED or FAILED
+
+    def __init__(self, applier: Applier, cache: Cache, threads: int = 3):
+        super().__init__()
+        self.applier = applier
+        self.cache = cache
+        self._pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="autoapply")
+        self._futures: dict = {}
+        self.done = 0
+        self.failed = 0
+
+    @property
+    def queued(self) -> int:
+        return len(self._futures)
+
+    def submit(self, res: AlbumResult) -> None:
+        """Call on the GUI thread; the row must already be marked WRITING."""
+        fut = self._pool.submit(self._run, res)
+        self._futures[fut] = res
+
+    def _run(self, res: AlbumResult) -> AlbumResult:
+        apply_one(res, self.applier, self.cache)
+        self.applied.emit(res)
+        return res
+
+    def finished(self, res: AlbumResult) -> None:
+        """GUI thread: book-keeping after ``applied`` was delivered."""
+        for fut, r in list(self._futures.items()):
+            if r is res:
+                del self._futures[fut]
+        if res.status == Status.APPLIED:
+            self.done += 1
+        else:
+            self.failed += 1
+
+    def stop(self, wait: bool = False) -> list[AlbumResult]:
+        """Cancel queued writes; returns the rows that were never started."""
+        cancelled = [f for f in list(self._futures) if f.cancel()]
+        not_started = [self._futures.pop(f) for f in cancelled]
+        self._pool.shutdown(wait=wait, cancel_futures=True)
+        return not_started

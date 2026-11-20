@@ -85,6 +85,7 @@ class Settings:
     contact: str = ""               # optional, added to the MusicBrainz User-Agent
     # Matching
     auto_approve_score: float = 0.85
+    auto_apply: bool = True         # write confident matches without waiting
     # Housekeeping
     remove_appledouble: bool = True
     lookup_cache_days: int = 30

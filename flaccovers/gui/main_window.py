@@ -8,7 +8,7 @@ from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QScrollArea, QSplitter, QTableView, QToolButton, QVBoxLayout,
@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         self._lookup_running = False
         self._lookup_queue: list = []
         self._searches: dict[str, workers.Job] = {}   # folder path -> latest re-search
+        self._auto: Optional[workers.AutoApplier] = None
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 860)
         self._build_menu()
@@ -194,6 +195,15 @@ class MainWindow(QMainWindow):
         b.clicked.connect(lambda: self._bulk_approve(False))
         bottom.addWidget(b)
         bottom.addStretch(1)
+        self.auto_box = QCheckBox("Write confident matches automatically")
+        self.auto_box.setToolTip(
+            "Albums that don't need review get their cover.jpg as soon as a match is "
+            "found, without asking. Undo Last Apply reverses them.")
+        self.auto_box.setChecked(self.s.auto_apply)
+        self.auto_box.toggled.connect(self._auto_toggled)
+        bottom.addWidget(self.auto_box)
+        self.auto_label = QLabel("")
+        bottom.addWidget(self.auto_label)
         self.apply_btn = QPushButton("Apply Ticked")
         self.apply_btn.clicked.connect(self.apply)
         bottom.addWidget(self.apply_btn)
@@ -274,7 +284,7 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool, text: str = "") -> None:
         self.scan_btn.setEnabled(not busy)
         self.apply_btn.setEnabled(not busy)
-        self.stop_btn.setEnabled(busy)
+        self.stop_btn.setEnabled(busy or bool(self._auto and self._auto.queued))
         self.progress.setVisible(busy)
         if not busy:
             self.progress.setFormat("")
@@ -343,6 +353,8 @@ class MainWindow(QMainWindow):
         if self.job:
             self.job.cancel.set()
             self.summary.setText("Stopping…")
+        self._stop_auto()
+        self.stop_btn.setEnabled(False)
 
     def scan(self) -> None:
         root = self.path_edit.text().strip()
@@ -352,6 +364,7 @@ class MainWindow(QMainWindow):
             return
         self.s.library_path = root
         self.s.save()
+        self._stop_auto()
         self.model.clear()
         self._show(None)
         self.summary.setText("Scanning…")
@@ -412,7 +425,55 @@ class MainWindow(QMainWindow):
     def _result_ready(self, res: AlbumResult) -> None:
         if res.folder.path in self._searches:
             return  # the user corrected this album; its re-search result wins
+        if (self.s.auto_apply and res.approved and res.status == Status.PROPOSED
+                and res.choice is not None and not self.proxy.is_hidden(res)):
+            self._auto_write(res)
         self._put(res)
+
+    # ---- automatic writing ----------------------------------------------------
+    def _auto_write(self, res: AlbumResult) -> None:
+        if self._auto is None:
+            self._auto = workers.AutoApplier(Applier(self.s, self._get_finder().http), self.cache)
+            self._auto.applied.connect(self._auto_applied)
+        res.status = Status.WRITING
+        self._auto.submit(res)
+        self._update_auto_label()
+        self.stop_btn.setEnabled(True)
+
+    def _auto_applied(self, res: AlbumResult) -> None:
+        if self._auto:
+            self._auto.finished(res)
+        self._put(res)
+        self._update_auto_label()
+        if self._auto and not self._auto.queued and not self._lookup_running:
+            self.stop_btn.setEnabled(False)
+
+    def _update_auto_label(self) -> None:
+        a = self._auto
+        if not a:
+            self.auto_label.setText("")
+            return
+        text = f"Written: {a.done}"
+        if a.queued:
+            text += f" · writing {a.queued}"
+        if a.failed:
+            text += f" · failed {a.failed}"
+        self.auto_label.setText(text)
+
+    def _stop_auto(self, wait: bool = False) -> None:
+        if not self._auto:
+            return
+        for r in self._auto.stop(wait=wait):
+            r.status = Status.PROPOSED  # never started: back to ticked, awaiting Apply
+            self._put(r)
+        self._auto = None  # a new batch (new undo run) starts next time
+
+    def _auto_toggled(self, on: bool) -> None:
+        self.s.auto_apply = on
+        self.s.save()
+        if not on:
+            self._stop_auto()
+            self._update_auto_label()
 
     def _put(self, res: AlbumResult) -> None:
         self.model.upsert(res)
@@ -444,7 +505,7 @@ class MainWindow(QMainWindow):
 
     def _bulk_approve(self, on: bool) -> None:
         for r in self.proxy.visible_results():
-            if r.choice is not None and r.status not in (Status.APPLIED, Status.PENDING):
+            if r.choice is not None and not r.locked and r.status != Status.PENDING:
                 r.approved = on
         self.model.layoutChanged.emit()
         self._update_counts()
@@ -560,7 +621,7 @@ class MainWindow(QMainWindow):
         out = [self.model.rows[r] for r in rows if r < len(self.model.rows)]
         if self.current is not None and not any(r is self.current for r in out):
             out.insert(0, self.current)
-        return [r for r in out if r.status != Status.APPLIED]
+        return [r for r in out if not r.locked]
 
     @staticmethod
     def _ckey(c: Candidate):
@@ -582,7 +643,7 @@ class MainWindow(QMainWindow):
 
     def _cand_clicked(self, item: QListWidgetItem) -> None:
         res = self.current
-        if not res or res.status == Status.APPLIED:
+        if not res or res.locked:
             return
         c = res.candidates[item.data(Qt.UserRole)]
         targets = self._selected()
@@ -640,9 +701,9 @@ class MainWindow(QMainWindow):
         other album in ``group`` (the selected rows). Several searches can run
         at once and the rest of the window stays usable."""
         artist, album = artist.strip(), album.strip()
-        if not album or res.status == Status.APPLIED:
+        if not album or res.locked:
             return
-        others = [r for r in (group or []) if r is not res and r.status != Status.APPLIED]
+        others = [r for r in (group or []) if r is not res and not r.locked]
         info = self._corrected_info(res, artist, album)
         job = workers.Job(workers.research_job, res, info, self._get_finder())
         for r, i in [(res, info)] + [(o, self._corrected_info(o, artist, album)) for o in others]:
@@ -695,6 +756,7 @@ class MainWindow(QMainWindow):
             self.job.cancel.set()
         for job in self._searches.values():
             job.cancel.set()
+        self._stop_auto(wait=True)  # let files being written finish cleanly
         if self.finder:
             self.finder.close()
         super().closeEvent(ev)

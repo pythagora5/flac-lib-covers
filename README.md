@@ -74,6 +74,12 @@ To run from source without building: `scripts/run.sh`.
 1. Check the library path (default `/Volumes/2TB`) and click **Scan Library**.
 2. Albums whose artwork is already fine are counted and hidden. Albums with a
    problem appear straight away and fill in as lookups finish.
+   **Confident matches are written straight away in the background**, with no
+   confirmation (status *Writing…* then *Done*). Untick **Write confident
+   matches automatically** at the bottom of the window to turn this off. The
+   whole automatic batch is one backup run, so *Undo Last Apply* reverses it.
+   Albums needing review, hidden problem types, and anything you search again
+   yourself are never written automatically.
 3. Review them:
    * **Ticked** rows are confident matches (score ≥ 85 %, adjustable).
    * *Show ▸ Needs review* lists the uncertain ones.
@@ -94,7 +100,8 @@ To run from source without building: `scripts/run.sh`.
    * **Problem types ▾** hides whole categories, e.g. *Artwork too small*.
      Hidden albums aren't searched and aren't applied. Showing them again
      searches them. The choice is remembered.
-4. Click **Apply Ticked**. Only ticked albums that are currently shown are written.
+4. Click **Apply Ticked** to write the albums you reviewed. Only ticked albums
+   that are currently shown are written.
 
 **Settings** (⌘,) holds your **Discogs personal access token** (stored in the
 macOS Keychain), output size, the "is it OK?" thresholds, and thread counts.
