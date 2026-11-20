@@ -52,7 +52,7 @@ def test_local_fixes_need_no_internet(library, tmp_path):
     s, cache, albums = _albums(library, tmp_path)
     http = FakeHttp()
     f = Finder(s, cache, http)
-    for rel, src in [("Embedded/Only", "Embedded in FLAC"), ("Big/Huge Art", "Existing file"),
+    for rel, src in [("Embedded/Only", "Copied from FLAC"), ("Big/Huge Art", "Existing file"),
                      ("Named/Wrong Name", "Folder: AlbumArt_Large.jpg"),
                      ("Mismatch/PNG As JPG", "Existing file")]:
         res = f.find(albums[rel])
@@ -129,6 +129,18 @@ def test_apply_writes_eversolo_cover_with_backup_and_undo(library, tmp_path):
     assert Image.open(library / "Big" / "Huge Art" / "cover.jpg").size == (3000, 3000)
     assert (small_dir / "folder.png").exists()
     assert last_run() is None
+
+
+def test_flac_files_are_never_modified(library, tmp_path):
+    import hashlib
+    s, cache, albums = _albums(library, tmp_path)
+    d = library / "Embedded" / "Only"
+    before = {p.name: hashlib.sha1(p.read_bytes()).hexdigest() for p in d.glob("*.flac")}
+    res = Finder(s, cache, FakeHttp()).find(albums["Embedded/Only"])
+    Applier(s, FakeHttp()).apply(res)
+    after = {p.name: hashlib.sha1(p.read_bytes()).hexdigest() for p in d.glob("*.flac")}
+    assert before == after
+    assert Image.open(d / "cover.jpg").size == (800, 800)  # folder art made from the FLAC art
 
 
 def test_to_cover_jpeg_handles_odd_inputs():

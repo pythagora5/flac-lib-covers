@@ -58,3 +58,53 @@ def test_full_flow(app, library, tmp_path, monkeypatch):
     assert _wait(app, lambda: sum(r.status == Status.APPLIED for r in w.model.rows) == n)
     assert (library / "Radiohead" / "OK Computer" / "cover.jpg").exists()
     w.close()
+
+
+def _window(app, library, tmp_path, monkeypatch, **settings):
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    http = FakeHttp()
+    real_finder = mw_mod.Finder
+    monkeypatch.setattr(mw_mod, "Finder", lambda s, c: real_finder(s, c, http))
+    s = Settings(library_path=str(library), use_discogs=False, **settings)
+    w = mw_mod.MainWindow(s, Cache(tmp_path / "c.db"))
+    w.show()
+    w.scan()
+    assert _wait(app, lambda: w.model.rows and not w._lookup_running
+                 and all(r.status != Status.PENDING for r in w.model.rows))
+    return w
+
+
+def test_hidden_problem_type_is_not_searched_or_applied(app, library, tmp_path, monkeypatch):
+    from flaccovers.models import Issue
+    w = _window(app, library, tmp_path, monkeypatch, hidden_issues=["TOO_SMALL"])
+    rows = {r.folder.rel: r for r in w.model.rows}
+    small = rows["Small/Tiny Art"]
+    assert small.status == Status.NOT_SEARCHED and not small.candidates
+    assert small not in w.proxy.visible_results()
+    assert small not in w._to_apply()
+    assert "1 hidden" in w.issue_btn.text()
+
+    w.issue_actions[Issue.TOO_SMALL].setChecked(True)   # show it again
+    assert _wait(app, lambda: small.folder.path in [r.folder.path for r in w.proxy.visible_results()]
+                 and w.model.rows[w.model._index[small.folder.path]].status != Status.PENDING
+                 and not w._lookup_running)
+    assert w.model.rows[w.model._index[small.folder.path]].status != Status.NOT_SEARCHED
+    assert Settings.load().hidden_issues == []
+    w.close()
+
+
+def test_editing_artist_album_searches_again(app, library, tmp_path, monkeypatch):
+    from flaccovers.gui.model import C_ALBUM, C_ARTIST
+    w = _window(app, library, tmp_path, monkeypatch)
+    row = next(i for i, r in enumerate(w.model.rows) if r.folder.rel == "Various Artists/Now 1")
+    assert w.model.rows[row].choice is None or not w.model.rows[row].approved
+
+    w.model.setData(w.model.index(row, C_ARTIST), "Radiohead")
+    w.model.setData(w.model.index(row, C_ALBUM), "OK Computer")
+    res = lambda: w.model.rows[row]  # noqa: E731
+    assert _wait(app, lambda: not w._searches)
+    assert (res().info.artist, res().info.album) == ("Radiohead", "OK Computer")
+    assert res().choice.source == "Deezer" and res().approved
+    assert res().status == Status.PROPOSED
+    w.close()

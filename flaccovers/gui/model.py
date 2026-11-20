@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 
-from ..models import AlbumResult, Status
+from ..models import AlbumResult, Issue, Status
 
 COLS = ["Apply", "Current", "Proposed", "Artist", "Album", "Problem", "Proposal", "Status"]
 C_APPLY, C_CUR, C_NEW, C_ARTIST, C_ALBUM, C_PROBLEM, C_PROPOSAL, C_STATUS = range(len(COLS))
@@ -24,6 +24,9 @@ def pixmap(data: Optional[bytes], size: int = ICON) -> Optional[QPixmap]:
 
 
 class AlbumModel(QAbstractTableModel):
+    # Emitted when the user edits Artist/Album in the table: (result, artist, album)
+    infoEdited = Signal(object, str, str)
+
     def __init__(self):
         super().__init__()
         self.rows: list[AlbumResult] = []
@@ -54,8 +57,7 @@ class AlbumModel(QAbstractTableModel):
         return self.rows[row]
 
     def approved(self) -> list[AlbumResult]:
-        return [r for r in self.rows if r.approved and r.choice is not None
-                and r.status not in (Status.APPLIED,)]
+        return [r for r in self.rows if is_ready(r)]
 
     # ---- Qt model API -------------------------------------------------------
     def rowCount(self, parent=QModelIndex()) -> int:
@@ -71,10 +73,11 @@ class AlbumModel(QAbstractTableModel):
 
     def flags(self, index):
         f = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        if index.column() == C_APPLY:
-            r = self.rows[index.row()]
-            if r.choice is not None and r.status != Status.APPLIED:
-                f |= Qt.ItemIsUserCheckable
+        r = self.rows[index.row()]
+        if index.column() == C_APPLY and r.choice is not None and r.status != Status.APPLIED:
+            f |= Qt.ItemIsUserCheckable
+        if index.column() in (C_ARTIST, C_ALBUM) and r.status != Status.APPLIED:
+            f |= Qt.ItemIsEditable
         return f
 
     def _thumb(self, r: AlbumResult, which: str) -> Optional[QPixmap]:
@@ -101,6 +104,8 @@ class AlbumModel(QAbstractTableModel):
                 return self._thumb(r, "cur")
             if col == C_NEW:
                 return self._thumb(r, "new")
+        if role == Qt.EditRole and col in (C_ARTIST, C_ALBUM):
+            return r.info.artist if col == C_ARTIST else r.info.album
         if role == Qt.DisplayRole:
             if col == C_CUR and r.current_thumb is None:
                 return "none"
@@ -117,7 +122,7 @@ class AlbumModel(QAbstractTableModel):
                                           r.status in (Status.FAILED, Status.APPLIED) else "")
         if role == Qt.ToolTipRole:
             if col in (C_ARTIST, C_ALBUM):
-                return r.folder.path
+                return f"{r.folder.path}\nDouble-click to correct and search again"
             if col == C_PROBLEM:
                 return r.folder.detail or r.folder.issue.value
             if col == C_STATUS:
@@ -136,6 +141,15 @@ class AlbumModel(QAbstractTableModel):
         return None
 
     def setData(self, index, value, role=Qt.EditRole):
+        if role == Qt.EditRole and index.column() in (C_ARTIST, C_ALBUM):
+            r = self.rows[index.row()]
+            text = str(value).strip()
+            artist = text if index.column() == C_ARTIST else r.info.artist
+            album = text if index.column() == C_ALBUM else r.info.album
+            if not text or (artist, album) == (r.info.artist, r.info.album):
+                return False
+            self.infoEdited.emit(r, artist, album)
+            return True
         if role == Qt.CheckStateRole and index.column() == C_APPLY:
             r = self.rows[index.row()]
             r.approved = Qt.CheckState(value) == Qt.Checked
@@ -149,23 +163,50 @@ class AlbumModel(QAbstractTableModel):
 FILTERS = ["All found problems", "Needs review", "Ready to apply", "Done", "Failed / not found"]
 
 
+def is_ready(r: AlbumResult) -> bool:
+    return r.approved and r.choice is not None and r.status not in (Status.APPLIED,
+                                                                    Status.PENDING)
+
+
 class FilterProxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self.mode = 0
         self.text = ""
+        self.hidden: set[Issue] = set()
         self.setSortRole(Qt.UserRole)
 
+    def _refilter(self, change) -> None:
+        # Qt 6.10 replaced invalidateFilter() with begin/endFilterChange().
+        if hasattr(self, "beginFilterChange"):
+            self.beginFilterChange()
+            change()
+            self.endFilterChange()
+        else:
+            change()
+            self.invalidateFilter()
+
+    def set_hidden(self, hidden: set[Issue]) -> None:
+        self._refilter(lambda: setattr(self, "hidden", set(hidden)))
+
+    def is_hidden(self, r: AlbumResult) -> bool:
+        return r.folder.issue in self.hidden and r.status != Status.APPLIED
+
+    def visible_results(self) -> list[AlbumResult]:
+        src = self.sourceModel()
+        return [src.rows[self.mapToSource(self.index(i, 0)).row()]
+                for i in range(self.rowCount())]
+
     def set_mode(self, mode: int) -> None:
-        self.mode = mode
-        self.invalidateFilter()
+        self._refilter(lambda: setattr(self, "mode", mode))
 
     def set_text(self, text: str) -> None:
-        self.text = text.lower().strip()
-        self.invalidateFilter()
+        self._refilter(lambda: setattr(self, "text", text.lower().strip()))
 
     def filterAcceptsRow(self, row, parent) -> bool:
         r: AlbumResult = self.sourceModel().rows[row]
+        if self.is_hidden(r):
+            return False
         if self.text and self.text not in r.folder.rel.lower():
             return False
         m = self.mode

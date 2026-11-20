@@ -8,7 +8,8 @@ and makes sure each album folder has artwork the **Eversolo T10** will display.
 * Works out the album from FLAC tags (ALBUMARTIST, ALBUM, DATE, MusicBrainz IDs,
   barcode) and falls back to the folder names (`1997 - OK Computer [FLAC 24-96]`
   → *OK Computer*, 1997).
-* Uses local art first (embedded pictures, oddly named images, oversized covers).
+* Uses local art first (oddly named images, oversized covers, or a picture embedded
+  in the FLACs, which is **copied** out to `cover.jpg`).
   Otherwise it searches **Deezer**, **MusicBrainz / Cover Art Archive**,
   **Discogs** and **Apple Music**.
 * Shows a **review screen** where every proposal can be checked, changed, re-searched,
@@ -34,7 +35,7 @@ This app therefore writes:
 | Size | 800×800 (no upscaling; smaller sources are kept at their size) |
 | Format | baseline (non-progressive) sRGB JPEG, metadata stripped, ≤ 900 KB |
 | Other `cover.*` / `folder.*` / `front.*` files | moved to the backup folder so the player can't pick a stale one |
-| FLAC files | **never modified** |
+| FLAC files | **never modified**: artwork is never embedded or removed. Albums whose art exists only inside the FLACs still get a `cover.jpg` |
 
 On the T10, turn on **Priority local image** in the music library scan settings
 ([guide][ev-lib]; a [DMP-A6 owner][ev-forum] reports it sits next to *Matching mode*)
@@ -78,9 +79,15 @@ To run from source without building: `scripts/run.sh`.
    * *Show ▸ Needs review* lists the uncertain ones.
    * Click a row to see the current and proposed covers and all candidates.
      Click a candidate to use it.
-   * Fix the artist/album text and click **Search Again (all sources)**, or
-     **Use Image File…** to pick your own.
-4. Click **Apply Ticked**.
+   * **Wrong album?** Double-click the Artist or Album cell in the list (or edit
+     the fields in the side panel), type the correct name and press Return.
+     All sources are searched again immediately, in the background, so you can
+     carry on correcting other albums meanwhile.
+   * **Use Image File…** picks your own image.
+   * **Problem types ▾** hides whole categories, e.g. *Artwork too small*.
+     Hidden albums aren't searched and aren't applied. Showing them again
+     searches them. The choice is remembered.
+4. Click **Apply Ticked**. Only ticked albums that are currently shown are written.
 
 **Settings** (⌘,) holds your **Discogs personal access token** (stored in the
 macOS Keychain), output size, the "is it OK?" thresholds, and thread counts.

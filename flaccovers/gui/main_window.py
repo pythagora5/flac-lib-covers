@@ -9,8 +9,9 @@ from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
-                               QPushButton, QSplitter, QTableView, QVBoxLayout, QWidget)
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea, QSplitter, QTableView, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import images
 from ..applier import Applier, last_run, undo_run
@@ -21,7 +22,7 @@ from ..metadata import album_info
 from ..models import AlbumInfo, AlbumResult, Candidate, Issue, Status
 from . import workers
 from .model import (C_ALBUM, C_APPLY, C_ARTIST, C_CUR, C_NEW, C_PROBLEM, C_PROPOSAL, C_STATUS,
-                    FILTERS, ICON, AlbumModel, FilterProxy, pixmap)
+                    FILTERS, ICON, AlbumModel, FilterProxy, is_ready, pixmap)
 from .settings_dialog import SettingsDialog
 
 class MainWindow(QMainWindow):
@@ -32,6 +33,9 @@ class MainWindow(QMainWindow):
         self.job: Optional[workers.Job] = None
         self.finder: Optional[Finder] = None
         self.current: Optional[AlbumResult] = None
+        self._lookup_running = False
+        self._lookup_queue: list = []
+        self._searches: dict[str, workers.Job] = {}   # folder path -> latest re-search
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 860)
         self._build_menu()
@@ -117,6 +121,21 @@ class MainWindow(QMainWindow):
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(FILTERS)
         fl.addWidget(self.filter_combo)
+        self.issue_btn = QToolButton()
+        self.issue_btn.setPopupMode(QToolButton.InstantPopup)
+        self.issue_menu = QMenu(self)
+        self.issue_actions: dict[Issue, QAction] = {}
+        hidden = set(self.s.hidden_issues)
+        for issue in Issue:
+            if issue == Issue.OK:
+                continue
+            act = self.issue_menu.addAction(issue.value)
+            act.setCheckable(True)
+            act.setChecked(issue.name not in hidden)
+            act.toggled.connect(self._issue_filter_changed)
+            self.issue_actions[issue] = act
+        self.issue_btn.setMenu(self.issue_menu)
+        fl.addWidget(self.issue_btn)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter by folder name…")
         self.search.setClearButtonEnabled(True)
@@ -130,6 +149,9 @@ class MainWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.filter_combo.currentIndexChanged.connect(self.proxy.set_mode)
         self.search.textChanged.connect(self.proxy.set_text)
+        self.proxy.set_hidden(self._hidden_issues())
+        self._update_issue_button()
+        self.model.infoEdited.connect(self.start_research)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -141,6 +163,8 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.setWordWrap(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
+                                   | QAbstractItemView.SelectedClicked)
         h = self.table.horizontalHeader()
         for col, w in ((C_APPLY, 50), (C_CUR, ICON + 16), (C_NEW, ICON + 16), (C_ARTIST, 160),
                        (C_PROBLEM, 170), (C_PROPOSAL, 200), (C_STATUS, 120)):
@@ -148,7 +172,11 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(C_ALBUM, QHeaderView.Stretch)
         self.table.selectionModel().currentRowChanged.connect(self._row_changed)
         split.addWidget(self.table)
-        split.addWidget(self._build_detail())
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._build_detail())
+        scroll.setMinimumWidth(400)
+        split.addWidget(scroll)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
         split.setSizes([980, 420])
@@ -156,10 +184,10 @@ class MainWindow(QMainWindow):
 
         # Bottom bar
         bottom = QHBoxLayout()
-        b = QPushButton("Tick All Proposed")
+        b = QPushButton("Tick All Shown")
         b.clicked.connect(lambda: self._bulk_approve(True))
         bottom.addWidget(b)
-        b = QPushButton("Untick All")
+        b = QPushButton("Untick All Shown")
         b.clicked.connect(lambda: self._bulk_approve(False))
         bottom.addWidget(b)
         bottom.addStretch(1)
@@ -172,6 +200,7 @@ class MainWindow(QMainWindow):
         self.model.dataChanged.connect(lambda *_: self._update_counts())
         self.model.rowsInserted.connect(lambda *_: self._update_counts())
         self.model.modelReset.connect(self._update_counts)
+        self.proxy.layoutChanged.connect(self._update_counts)
 
     def _build_detail(self) -> QWidget:
         w = QWidget()
@@ -206,6 +235,7 @@ class MainWindow(QMainWindow):
         self.cands.setMovement(QListWidget.Static)
         self.cands.setWordWrap(True)
         self.cands.setGridSize(QSize(130, 160))
+        self.cands.setMinimumHeight(180)
         self.cands.itemClicked.connect(self._cand_clicked)
         v.addWidget(self.cands, 1)
 
@@ -213,9 +243,13 @@ class MainWindow(QMainWindow):
         self.e_artist, self.e_album = QLineEdit(), QLineEdit()
         form.addRow("Artist:", self.e_artist)
         form.addRow("Album:", self.e_album)
+        self.e_artist.returnPressed.connect(self.research)
+        self.e_album.returnPressed.connect(self.research)
+        self.e_artist.setPlaceholderText("Correct the artist, then press Return")
+        self.e_album.setPlaceholderText("Correct the album, then press Return")
         v.addLayout(form)
         row = QHBoxLayout()
-        self.research_btn = QPushButton("Search Again (all sources)")
+        self.research_btn = QPushButton("Search Again")
         self.research_btn.clicked.connect(self.research)
         row.addWidget(self.research_btn)
         b = QPushButton("Use Image File…")
@@ -238,7 +272,6 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(not busy)
         self.apply_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
-        self.research_btn.setEnabled(not busy)
         self.progress.setVisible(busy)
         if not busy:
             self.progress.setFormat("")
@@ -248,9 +281,34 @@ class MainWindow(QMainWindow):
     def _reveal(self, path: str) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
+    def _to_apply(self) -> list[AlbumResult]:
+        return [r for r in self.proxy.visible_results() if is_ready(r)]
+
     def _update_counts(self) -> None:
-        n = len(self.model.approved())
-        self.apply_btn.setText(f"Apply Ticked ({n})")
+        self.apply_btn.setText(f"Apply Ticked ({len(self._to_apply())})")
+
+    def _hidden_issues(self) -> set[Issue]:
+        return {i for i, a in self.issue_actions.items() if not a.isChecked()}
+
+    def _update_issue_button(self) -> None:
+        n = len(self._hidden_issues())
+        self.issue_btn.setText("Problem types: all" if n == 0 else f"Problem types: {n} hidden")
+
+    def _issue_filter_changed(self) -> None:
+        hidden = self._hidden_issues()
+        self.s.hidden_issues = sorted(i.name for i in hidden)
+        self.s.save()
+        self.proxy.set_hidden(hidden)
+        self._update_issue_button()
+        self._update_counts()
+        # Albums that were skipped while hidden get searched now.
+        rows = [r for r in self.model.rows
+                if r.status == Status.NOT_SEARCHED and r.folder.issue not in hidden]
+        for r in rows:
+            r.status = Status.PENDING
+            self.model.upsert(r)
+        if rows:
+            self._start_lookup([r.folder for r in rows])
 
     def _on_progress(self, done: int, total: int, text: str) -> None:
         if total:
@@ -262,10 +320,9 @@ class MainWindow(QMainWindow):
         if text:
             self.statusBar().showMessage(text, 3000)
 
-    def _make_finder(self) -> Finder:
-        if self.finder:
-            self.finder.close()
-        self.finder = Finder(self.s, self.cache)
+    def _get_finder(self) -> Finder:
+        if self.finder is None:
+            self.finder = Finder(self.s, self.cache)
         return self.finder
 
     # ---- actions --------------------------------------------------------------
@@ -276,7 +333,8 @@ class MainWindow(QMainWindow):
             self.path_edit.setText(d)
 
     def open_settings(self) -> None:
-        SettingsDialog(self.s, self).exec()
+        if SettingsDialog(self.s, self).exec():
+            self.finder = None  # rebuilt with the new sources/token on next search
 
     def stop(self) -> None:
         if self.job:
@@ -321,13 +379,27 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             QMessageBox.information(self, APP_NAME, "All albums already have suitable artwork.")
             return
+        hidden = self._hidden_issues()
+        todo = []
         for a in problems:  # show rows straight away; they fill in as lookups finish
-            self.model.upsert(AlbumResult(folder=a, info=album_info(a)))
+            skip = a.issue in hidden
+            self.model.upsert(AlbumResult(folder=a, info=album_info(a),
+                                          status=Status.NOT_SEARCHED if skip else Status.PENDING))
+            if not skip:
+                todo.append(a)
+        self._set_busy(False)
+        if todo:
+            self._start_lookup(todo)
+
+    def _start_lookup(self, folders: list) -> None:
+        if self._lookup_running:
+            self._lookup_queue.extend(folders)
+            return
+        self._lookup_running = True
         self._set_busy(True, "Finding artwork…")
-        self.progress.setRange(0, len(problems))
+        self.progress.setRange(0, len(folders))
         self.progress.setValue(0)
-        job = workers.Job(workers.lookup_job, problems, self._make_finder(),
-                          self.s.lookup_threads)
+        job = workers.Job(workers.lookup_job, folders, self._get_finder(), self.s.lookup_threads)
         job.signals.item.connect(self._result_ready)
         job.signals.progress.connect(self._on_progress)
         job.signals.finished.connect(self._lookup_done)
@@ -335,11 +407,22 @@ class MainWindow(QMainWindow):
         self.job = workers.start(job)
 
     def _result_ready(self, res: AlbumResult) -> None:
+        if res.folder.path in self._searches:
+            return  # the user corrected this album; its re-search result wins
+        self._put(res)
+
+    def _put(self, res: AlbumResult) -> None:
         self.model.upsert(res)
         if self.current and self.current.folder.path == res.folder.path:
             self._show(res)
 
     def _lookup_done(self, _n) -> None:
+        self._lookup_running = False
+        if self._lookup_queue and not (self.job and self.job.cancel.is_set()):
+            queued, self._lookup_queue = self._lookup_queue, []
+            self._start_lookup(queued)
+            return
+        self._lookup_queue = []
         self._set_busy(False)
         rows = self.model.rows
         ready = sum(1 for r in rows if r.approved)
@@ -352,21 +435,22 @@ class MainWindow(QMainWindow):
             self.table.selectRow(0)
 
     def _failed(self, msg: str) -> None:
+        self._lookup_running = False
         self._set_busy(False)
         QMessageBox.critical(self, APP_NAME, msg)
 
     def _bulk_approve(self, on: bool) -> None:
-        for r in self.model.rows:
-            if r.choice is not None and r.status != Status.APPLIED:
+        for r in self.proxy.visible_results():
+            if r.choice is not None and r.status not in (Status.APPLIED, Status.PENDING):
                 r.approved = on
         self.model.layoutChanged.emit()
         self._update_counts()
         self._show(self.current)
 
     def apply(self) -> None:
-        todo = self.model.approved()
+        todo = self._to_apply()
         if not todo:
-            QMessageBox.information(self, APP_NAME, "Nothing is ticked.")
+            QMessageBox.information(self, APP_NAME, "Nothing shown is ticked.")
             return
         ok = QMessageBox.question(
             self, APP_NAME,
@@ -376,9 +460,9 @@ class MainWindow(QMainWindow):
         if ok != QMessageBox.Yes:
             return
         self._set_busy(True, "Writing artwork…")
-        applier = Applier(self.s, self.finder.http if self.finder else None)
+        applier = Applier(self.s, self._get_finder().http)
         job = workers.Job(workers.apply_job, todo, applier, self.cache)
-        job.signals.item.connect(self._result_ready)
+        job.signals.item.connect(self._put)
         job.signals.progress.connect(self._on_progress)
         job.signals.finished.connect(lambda n: (
             self._set_busy(False),
@@ -505,26 +589,55 @@ class MainWindow(QMainWindow):
 
     def research(self) -> None:
         res = self.current
-        if not res:
+        if res:
+            self.start_research(res, self.e_artist.text(), self.e_album.text())
+
+    def start_research(self, res: AlbumResult, artist: str, album: str) -> None:
+        """Search all sources again with a corrected artist / album.
+
+        Runs in the background; several can run at once and the rest of the
+        window stays usable."""
+        artist, album = artist.strip(), album.strip()
+        if not album or res.status == Status.APPLIED:
             return
-        info = AlbumInfo(**{**res.info.__dict__,
-                            "artist": self.e_artist.text().strip(),
-                            "album": self.e_album.text().strip(),
-                            "mb_release_id": "", "mb_releasegroup_id": ""})
-        if (info.artist, info.album) == (res.info.artist, res.info.album):
-            info.mb_release_id = res.info.mb_release_id
-            info.mb_releasegroup_id = res.info.mb_releasegroup_id
-        self._set_busy(True, "Searching…")
-        self.progress.setRange(0, 0)
-        finder = self.finder or self._make_finder()
-        job = workers.Job(workers.research_job, res, info, finder)
-        job.signals.finished.connect(lambda new: (self._result_ready(new), self._set_busy(False)))
-        job.signals.failed.connect(self._failed)
-        self.job = workers.start(job)
+        changed = (artist, album) != (res.info.artist, res.info.album)
+        info = AlbumInfo(**{**res.info.__dict__, "artist": artist, "album": album})
+        if changed:  # tag IDs belong to the old (wrong) identification
+            info.mb_release_id = info.mb_releasegroup_id = ""
+        res.info = info
+        res.status = Status.PENDING
+        res.approved = False
+        res.message = ""
+        self._put(res)
+
+        job = workers.Job(workers.research_job, res, info, self._get_finder())
+        path = res.folder.path
+        self._searches[path] = job
+
+        def done(new: AlbumResult) -> None:
+            if self._searches.get(path) is not job:
+                return  # a newer edit superseded this search
+            del self._searches[path]
+            new.info = info
+            self._put(new)
+            self.statusBar().showMessage(f"Search finished: {info.artist} – {info.album}", 4000)
+
+        def failed(msg: str) -> None:
+            if self._searches.get(path) is job:
+                del self._searches[path]
+                res.status, res.message = Status.FAILED, msg
+                self._put(res)
+
+        job.signals.finished.connect(done)
+        job.signals.failed.connect(failed)
+        workers.start(job)
+        self.statusBar().showMessage(f"Searching for {artist} – {album}…", 4000)
 
     def closeEvent(self, ev) -> None:
         if self.job:
             self.job.cancel.set()
+        for job in self._searches.values():
+            job.cancel.set()
         if self.finder:
             self.finder.close()
         super().closeEvent(ev)

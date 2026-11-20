@@ -88,6 +88,7 @@ class Settings:
     # Housekeeping
     remove_appledouble: bool = True
     lookup_cache_days: int = 30
+    hidden_issues: list = field(default_factory=list)   # Issue names hidden in review
     extra: dict = field(default_factory=dict)
 
     # ---- persistence ----------------------------------------------------

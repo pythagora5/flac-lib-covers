@@ -23,6 +23,8 @@ THUMB_PX = 300
 MAX_CANDIDATES = 10
 THUMBS_TO_FETCH = 8
 STRONG_MATCH = 0.92
+# Art found inside the FLACs is only *copied* to cover.jpg; FLACs are never written.
+EMBEDDED_SOURCE = "Copied from FLAC"
 GOOD_NAME = re.compile(r"front|cover|folder|album|art", re.I)
 BAD_NAME = re.compile(r"back|cd\d*|disc|inlay|booklet|inside|tray|rear|label|matrix|spine", re.I)
 
@@ -77,7 +79,7 @@ class Finder:
             w, h = images.probe_bytes(data)
             if w:
                 ok = min(w, h) >= s.min_size
-                out.append(Candidate(source="Embedded in FLAC", data=data, width=w, height=h,
+                out.append(Candidate(source=EMBEDDED_SOURCE, data=data, width=w, height=h,
                                      score=1.0 if ok else 0.55))
         for name in folder.other_images:
             info = images.inspect(os.path.join(folder.path, name))

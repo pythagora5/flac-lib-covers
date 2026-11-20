@@ -114,6 +114,7 @@ class Candidate:
 
 class Status(str, Enum):
     PENDING = "Searching…"
+    NOT_SEARCHED = "Hidden – not searched"
     PROPOSED = "Proposed"
     NEEDS_REVIEW = "Needs review"
     NOT_FOUND = "Nothing found"
