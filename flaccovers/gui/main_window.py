@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, QUrl
@@ -157,7 +158,7 @@ class MainWindow(QMainWindow):
         self.table.setModel(self.proxy)
         self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)  # ⌘/Shift-click
         self.table.setIconSize(QSize(ICON, ICON))
         self.table.verticalHeader().setDefaultSectionSize(ICON + 8)
         self.table.verticalHeader().hide()
@@ -171,6 +172,8 @@ class MainWindow(QMainWindow):
             self.table.setColumnWidth(col, w)
         h.setSectionResizeMode(C_ALBUM, QHeaderView.Stretch)
         self.table.selectionModel().currentRowChanged.connect(self._row_changed)
+        self.table.selectionModel().selectionChanged.connect(
+            lambda *_: self._show(self.current))
         split.addWidget(self.table)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -511,7 +514,11 @@ class MainWindow(QMainWindow):
             self.e_album.clear()
             return
         f = res.folder
-        self.d_title.setText(f"<b>{res.info.artist}</b> — {res.info.album}"
+        n = len(self._selected())
+        multi = (f"<span style='color:#d68a00'><b>{n} albums selected</b> – clicking a "
+                 "candidate, Search Again, Use Image File and Don't Change apply to all of "
+                 "them</span><br>") if n > 1 else ""
+        self.d_title.setText(f"{multi}<b>{res.info.artist}</b> — {res.info.album}"
                              f"<br><small>{f.path}</small>")
         cur = pixmap(res.current_thumb, 190)
         if cur:
@@ -545,24 +552,52 @@ class MainWindow(QMainWindow):
                 item.setSelected(True)
             self.cands.addItem(item)
 
+    # ---- multi-row selection -------------------------------------------------
+    def _selected(self) -> list[AlbumResult]:
+        """Selected rows (plus the current one), excluding already-applied albums."""
+        rows = sorted({self.proxy.mapToSource(i).row()
+                       for i in self.table.selectionModel().selectedRows()})
+        out = [self.model.rows[r] for r in rows if r < len(self.model.rows)]
+        if self.current is not None and not any(r is self.current for r in out):
+            out.insert(0, self.current)
+        return [r for r in out if r.status != Status.APPLIED]
+
+    @staticmethod
+    def _ckey(c: Candidate):
+        return c.image_url or c.local_path or (id(c.data) if c.data else c.thumb_url)
+
+    def _assign(self, r: AlbumResult, c: Candidate) -> None:
+        """Make ``c`` the chosen image for ``r`` (copying it in if needed)."""
+        key = self._ckey(c)
+        idx = next((i for i, x in enumerate(r.candidates) if self._ckey(x) == key), None)
+        if idx is None:
+            r.candidates.insert(0, replace(c))
+            idx = 0
+        r.chosen = idx
+        r.approved = True
+        r.message = ""
+        if r.status != Status.PENDING:
+            r.status = Status.PROPOSED
+        self.model.upsert(r)
+
     def _cand_clicked(self, item: QListWidgetItem) -> None:
         res = self.current
         if not res or res.status == Status.APPLIED:
             return
-        res.chosen = item.data(Qt.UserRole)
-        res.approved = True
-        if res.status in (Status.NEEDS_REVIEW, Status.SKIPPED):
-            res.status = Status.PROPOSED
-        self.model.upsert(res)
+        c = res.candidates[item.data(Qt.UserRole)]
+        targets = self._selected()
+        for r in targets:
+            self._assign(r, c)
+        if len(targets) > 1:
+            self.statusBar().showMessage(f"Image chosen for {len(targets)} albums", 4000)
         self._show(res)
 
     def skip_current(self) -> None:
-        res = self.current
-        if res and res.status != Status.APPLIED:
-            res.approved = False
-            res.status = Status.SKIPPED
-            self.model.upsert(res)
-            self._show(res)
+        for r in self._selected():
+            r.approved = False
+            r.status = Status.SKIPPED
+            self.model.upsert(r)
+        self._show(self.current)
 
     def choose_file(self) -> None:
         res = self.current
@@ -580,53 +615,75 @@ class MainWindow(QMainWindow):
             thumb = make_thumb(fh.read())
         c = Candidate(source="Chosen file", local_path=path, width=info.width,
                       height=info.height, score=1.0, thumb=thumb, note=path)
-        res.candidates.insert(0, c)
-        res.chosen = 0
-        res.approved = True
-        res.status = Status.PROPOSED
-        self.model.upsert(res)
-        self._show(res)
+        for r in self._selected():
+            self._assign(r, c)
+        self._show(self.current)
 
     def research(self) -> None:
         res = self.current
         if res:
-            self.start_research(res, self.e_artist.text(), self.e_album.text())
+            self.start_research(res, self.e_artist.text(), self.e_album.text(),
+                                group=self._selected())
 
-    def start_research(self, res: AlbumResult, artist: str, album: str) -> None:
+    @staticmethod
+    def _corrected_info(r: AlbumResult, artist: str, album: str) -> AlbumInfo:
+        info = AlbumInfo(**{**r.info.__dict__, "artist": artist, "album": album})
+        if (artist, album) != (r.info.artist, r.info.album):
+            info.mb_release_id = info.mb_releasegroup_id = ""  # IDs were for the old match
+        return info
+
+    def start_research(self, res: AlbumResult, artist: str, album: str,
+                       group: Optional[list[AlbumResult]] = None) -> None:
         """Search all sources again with a corrected artist / album.
 
-        Runs in the background; several can run at once and the rest of the
-        window stays usable."""
+        One search runs in the background; its results are shared with every
+        other album in ``group`` (the selected rows). Several searches can run
+        at once and the rest of the window stays usable."""
         artist, album = artist.strip(), album.strip()
         if not album or res.status == Status.APPLIED:
             return
-        changed = (artist, album) != (res.info.artist, res.info.album)
-        info = AlbumInfo(**{**res.info.__dict__, "artist": artist, "album": album})
-        if changed:  # tag IDs belong to the old (wrong) identification
-            info.mb_release_id = info.mb_releasegroup_id = ""
-        res.info = info
-        res.status = Status.PENDING
-        res.approved = False
-        res.message = ""
-        self._put(res)
-
+        others = [r for r in (group or []) if r is not res and r.status != Status.APPLIED]
+        info = self._corrected_info(res, artist, album)
         job = workers.Job(workers.research_job, res, info, self._get_finder())
-        path = res.folder.path
-        self._searches[path] = job
+        for r, i in [(res, info)] + [(o, self._corrected_info(o, artist, album)) for o in others]:
+            r.info = i
+            r.status = Status.PENDING
+            r.approved = False
+            r.message = ""
+            self._searches[r.folder.path] = job
+            self._put(r)
 
         def done(new: AlbumResult) -> None:
-            if self._searches.get(path) is not job:
-                return  # a newer edit superseded this search
-            del self._searches[path]
-            new.info = info
-            self._put(new)
-            self.statusBar().showMessage(f"Search finished: {info.artist} – {info.album}", 4000)
+            if self._searches.get(res.folder.path) is job:
+                del self._searches[res.folder.path]
+                new.info = info
+                self._put(new)
+            shared = [c for c in new.candidates if not c.is_local or c.source == "Chosen file"]
+            for o in others:
+                if self._searches.get(o.folder.path) is not job:
+                    continue  # edited again since
+                del self._searches[o.folder.path]
+                own = [c for c in o.candidates if c.is_local and c.source != "Chosen file"]
+                o.candidates = sorted([replace(c) for c in shared] + own,
+                                      key=lambda c: c.score, reverse=True)
+                if o.candidates:
+                    o.chosen = 0
+                    o.approved = o.candidates[0].score >= self.s.auto_approve_score
+                    o.status = Status.PROPOSED if o.approved else Status.NEEDS_REVIEW
+                else:
+                    o.chosen, o.approved, o.status = -1, False, Status.NOT_FOUND
+                self._put(o)
+            n = 1 + len(others)
+            self.statusBar().showMessage(
+                f"Search finished: {info.artist} – {info.album}"
+                + (f" (results shared with {n} albums)" if n > 1 else ""), 5000)
 
         def failed(msg: str) -> None:
-            if self._searches.get(path) is job:
-                del self._searches[path]
-                res.status, res.message = Status.FAILED, msg
-                self._put(res)
+            for r in [res] + others:
+                if self._searches.get(r.folder.path) is job:
+                    del self._searches[r.folder.path]
+                    r.status, r.message = Status.FAILED, msg
+                    self._put(r)
 
         job.signals.finished.connect(done)
         job.signals.failed.connect(failed)

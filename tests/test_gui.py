@@ -108,3 +108,57 @@ def test_editing_artist_album_searches_again(app, library, tmp_path, monkeypatch
     assert res().choice.source == "Deezer" and res().approved
     assert res().status == Status.PROPOSED
     w.close()
+
+
+def _select(w, rels):
+    from PySide6.QtCore import QItemSelectionModel
+    sm = w.table.selectionModel()
+    sm.clearSelection()
+    first = True
+    for i in range(w.proxy.rowCount()):
+        r = w.proxy.visible_results()[i]
+        if r.folder.rel in rels:
+            idx = w.proxy.index(i, 0)
+            flags = QItemSelectionModel.Select | QItemSelectionModel.Rows
+            if first:
+                sm.setCurrentIndex(idx, flags)
+                first = False
+            else:
+                sm.select(idx, flags)
+
+
+def test_candidate_click_applies_to_all_selected_rows(app, library, tmp_path, monkeypatch):
+    w = _window(app, library, tmp_path, monkeypatch)
+    rels = ["Radiohead/OK Computer", "Various Artists/Now 1", "Small/Tiny Art"]
+    _select(w, rels)
+    assert len(w._selected()) == 3
+    assert "3 albums selected" in w.d_title.text()
+    item = w.cands.item(0)
+    chosen = w.current.candidates[item.data(0x0100)]
+    w._cand_clicked(item)
+    rows = {r.folder.rel: r for r in w.model.rows}
+    for rel in rels:
+        assert rows[rel].approved and rows[rel].status == Status.PROPOSED
+        assert w._ckey(rows[rel].choice) == w._ckey(chosen)
+    w.skip_current()
+    assert all(rows[rel].status == Status.SKIPPED and not rows[rel].approved for rel in rels)
+    w.close()
+
+
+def test_search_again_shares_results_with_selected_rows(app, library, tmp_path, monkeypatch):
+    w = _window(app, library, tmp_path, monkeypatch)
+    rels = ["Various Artists/Now 1", "Named/Wrong Name"]
+    _select(w, rels)
+    w.e_artist.setText("Radiohead")
+    w.e_album.setText("OK Computer")
+    w.research()
+    assert _wait(app, lambda: not w._searches)
+    rows = {r.folder.rel: r for r in w.model.rows}
+    for rel in rels:
+        r = rows[rel]
+        assert (r.info.artist, r.info.album) == ("Radiohead", "OK Computer")
+        assert any(c.source == "Deezer" for c in r.candidates)
+    # the other album keeps its own local image as an option too
+    assert any(c.source.startswith("Folder:") for c in rows["Named/Wrong Name"].candidates)
+    assert rows["Named/Wrong Name"].info.track_count == 3
+    w.close()

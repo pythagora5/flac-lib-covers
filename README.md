@@ -83,6 +83,13 @@ To run from source without building: `scripts/run.sh`.
      the fields in the side panel), type the correct name and press Return.
      All sources are searched again immediately, in the background, so you can
      carry on correcting other albums meanwhile.
+   * **Several albums at once:** select rows with ⌘-click or Shift-click (⌘A
+     selects all shown). Clicking a candidate, **Search Again** (or Return in
+     the Artist/Album fields), **Use Image File…** and **Don't Change This
+     Album** then apply to every selected row. A search runs once and its
+     results are shared with all of them; each album also keeps its own local
+     images as options. Handy for one album whose tracks are split across
+     several folders.
    * **Use Image File…** picks your own image.
    * **Problem types ▾** hides whole categories, e.g. *Artwork too small*.
      Hidden albums aren't searched and aren't applied. Showing them again
