@@ -1,0 +1,5 @@
+PySide6-Essentials>=6.7
+mutagen>=1.47
+Pillow>=10.3
+requests>=2.32
+keyring>=25.0
