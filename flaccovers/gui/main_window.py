@@ -757,6 +757,7 @@ class MainWindow(QMainWindow):
         for job in self._searches.values():
             job.cancel.set()
         self._stop_auto(wait=True)  # let files being written finish cleanly
+        self.cache.close()
         if self.finder:
             self.finder.close()
         super().closeEvent(ev)

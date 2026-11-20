@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 
@@ -26,6 +27,12 @@ def inspect(path: str, size_bytes: int | None = None) -> ImageInfo:
             info.width, info.height = im.size
             info.fmt = im.format or ""
             info.progressive = bool(im.info.get("progressive") or im.info.get("progression"))
+    except OSError as exc:
+        if exc.errno is not None and exc.errno != errno.ENOENT:
+            # A system error (too many open files, drive unplugged, I/O error)
+            # says nothing about the image; never report it as damaged.
+            raise
+        info.readable = False  # Pillow decode errors have no errno
     except Exception:
         info.readable = False
     return info

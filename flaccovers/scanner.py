@@ -79,8 +79,10 @@ def _walk(top: str, recurse: bool = True) -> Iterable[tuple[str, int, list[str],
         d = stack.pop()
         try:
             it = os.scandir(d)
-        except OSError:
-            continue
+        except (PermissionError, FileNotFoundError):
+            continue  # unreadable/vanished folder: skip it
+        # any other OSError (too many open files, drive unplugged) stops the
+        # scan loudly rather than silently missing albums
         flacs: list[str] = []
         imgs: list[os.DirEntry] = []
         with it:
@@ -93,7 +95,7 @@ def _walk(top: str, recurse: bool = True) -> Iterable[tuple[str, int, list[str],
                         if recurse and not _is_hidden(name):
                             stack.append(e.path)
                         continue
-                except OSError:
+                except (PermissionError, FileNotFoundError):
                     continue
                 low = name.lower()
                 if low.endswith(AUDIO_EXT):

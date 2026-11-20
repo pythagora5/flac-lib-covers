@@ -36,6 +36,9 @@ class FakeHttp:
             return {"results": []}
         return None
 
+    def close(self):
+        pass
+
     def get_bytes(self, url, headers=None, limit=0):
         self.urls.append(url)
         ok = url.startswith(("https://img/", "https://coverartarchive.org/"))

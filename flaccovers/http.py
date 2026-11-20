@@ -48,23 +48,26 @@ class HttpClient:
         self.user_agent = user_agent
         self.timeout = timeout
         self._limiters = {h: RateLimiter(i) for h, i in MIN_INTERVAL.items()}
-        self._local = threading.local()
+        # One shared session: urllib3's connection pools are thread-safe, and
+        # this caps open sockets at pool_maxsize per host for the whole app.
+        s = requests.Session()
+        retry = Retry(
+            total=3, backoff_factor=0.5, backoff_max=8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",), respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=12,
+                              pool_block=True)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers["User-Agent"] = user_agent
+        self._s = s
 
     def _session(self) -> requests.Session:
-        s = getattr(self._local, "session", None)
-        if s is None:
-            s = requests.Session()
-            retry = Retry(
-                total=3, backoff_factor=0.5, backoff_max=8,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=("GET",), respect_retry_after_header=True,
-            )
-            adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
-            s.mount("https://", adapter)
-            s.mount("http://", adapter)
-            s.headers["User-Agent"] = self.user_agent
-            self._local.session = s
-        return s
+        return self._s
+
+    def close(self) -> None:
+        self._s.close()
 
     def _throttle(self, url: str) -> None:
         lim = self._limiters.get(urlparse(url).hostname or "")

@@ -65,6 +65,7 @@ class Finder:
 
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self.http.close()
 
     # ---- local candidates ---------------------------------------------------
     def local_candidates(self, folder: AlbumFolder, embedded: list[bytes]) -> list[Candidate]:
